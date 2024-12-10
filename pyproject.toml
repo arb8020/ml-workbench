@@ -1,0 +1,12 @@
+[project]
+name = "ml-workbench"
+version = "1.0.0"
+description = "workbench of stuff i've reimplemented"
+readme = "README.md"
+dependencies = [
+    "jax>=0.4.37",
+    "numpy>=2.2.0",
+    "pytest>=8.3.4",
+    "torch==2.2.2",
+    "transformers>=4.47.0",
+]
