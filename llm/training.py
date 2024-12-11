@@ -383,31 +383,45 @@ def train(params: Dict, model_config: ModelConfig, model_name: str, tokens: jnp.
 
 class SamplerConfig(NamedTuple):
     temp: float = 1.0
-    top_k: Optional[int] = None 
+    min_p: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[float] = None
     max_tokens: int = 100
     key: jax.random.PRNGKey = jax.random.PRNGKey(0)
 
-def sample_token(logits: jax.Array, key: jax.random.PRNGKey, temp: float = 1.0, top_k: Optional[int] = None) -> jax.Array:
+def sample_token(logits: jax.Array, sampler_config: SamplerConfig) -> jax.Array:
     """
     samples token from a distribution, includes filtering parameters like temperature/top_k for controlling generation
     radford et al, 2019: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+    nguyen et al, 2024: https://arxiv.org/abs/2407.01082 (min_p)
+    holtzman et al, 2019: https://arxiv.org/abs/1904.09751 (top_p)
     """
-
-    scaled_logits = logits / temp
-
+        
+    scaled_logits = logits / sampler_config.temp
     probs = jax.nn.softmax(scaled_logits, axis=-1)
-    sorted_indices = jnp.argsort(scaled_logits, axis=-1)[:, ::-1]
-    sorted_logits = jnp.take_along_axis(scaled_logits, sorted_indices, axis=-1)
-
-    cutoff = jnp.min(scaled_logits, axis=-1, keepdims=True)
-
-    if top_k is not None:
-        top_k_cutoff = sorted_logits[:, top_k-1:top_k]
-        cutoff = jnp.maximum(cutoff, top_k_cutoff)
-
-    filtered_logits = jnp.where(scaled_logits < cutoff, -jnp.inf, scaled_logits)
-
-    return jax.random.categorical(key, filtered_logits, shape=(1,))
+    
+    if sampler_config.min_p:
+        max_prob = jnp.max(probs)
+        min_p_threshold = sampler_config.min_p * max_prob
+        scaled_logits = jnp.where(probs < min_p_threshold, float('-inf'), scaled_logits)
+        return jax.random.categorical(sampler_config.key, scaled_logits)
+        
+    elif sampler_config.top_p:
+        sorted_indices = jnp.argsort(probs, axis=-1)[::-1]
+        cumsum = jnp.cumsum(probs[sorted_indices])
+        sorted_mask = cumsum <= sampler_config.top_p
+        mask = jnp.zeros_like(probs).at[sorted_indices].set(sorted_mask)
+        scaled_logits = jnp.where(mask, scaled_logits, float('-inf'))
+        return jax.random.categorical(sampler_config.key, scaled_logits)
+        
+    elif sampler_config.top_k:
+        top_k = jnp.minimum(sampler_config.top_k, probs.shape[-1])
+        top_k_probs = jnp.sort(probs, axis=-1)[-top_k:]
+        threshold = top_k_probs[0]
+        scaled_logits = jnp.where(probs < threshold, float('-inf'), scaled_logits)
+        return jax.random.categorical(sampler_config.key, scaled_logits)
+        
+    return jax.random.categorical(sampler_config.key, scaled_logits)
 
 def generate(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, sampler_config: SamplerConfig, stream: bool = True, tokenizer: Tokenizer = None) -> jax.Array:
     """
@@ -422,7 +436,7 @@ def generate(params: Dict, model_config: ModelConfig, model_name: str, tokens: j
         key, subkey = jax.random.split(key, 2)
         logits = model_dict[model_name](params, model_config, tokens)
         last_token_logit = logits[-1:]
-        next_token = sample_token(last_token_logit, key=subkey, temp=sampler_config.temp, top_k=sampler_config.top_k)
+        next_token = sample_token(last_token_logit, sampler_config)
 
         if stream and tokenizer:
             print(tokenizer.decode(next_token), end='', flush=True)
