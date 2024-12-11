@@ -381,6 +381,12 @@ def train(params: Dict, model_config: ModelConfig, model_name: str, tokens: jnp.
 
 # Inference
 
+class SamplerConfig(NamedTuple):
+    temp: float = 1.0
+    top_k: Optional[int] = None 
+    max_tokens: int = 100
+    key: jax.random.PRNGKey = jax.random.PRNGKey(0)
+
 def sample_token(logits: jax.Array, key: jax.random.PRNGKey, temp: float = 1.0, top_k: Optional[int] = None) -> jax.Array:
     """
     samples token from a distribution, includes filtering parameters like temperature/top_k for controlling generation
@@ -403,30 +409,30 @@ def sample_token(logits: jax.Array, key: jax.random.PRNGKey, temp: float = 1.0, 
 
     return jax.random.categorical(key, filtered_logits, shape=(1,))
 
-def generate(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array,max_new: int, key: jax.random.PRNGKey, temp: float = 1.0, top_k: Optional[int] = None) -> jax.Array:
+def generate(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, sampler_config: SamplerConfig, stream: bool = True, tokenizer: Tokenizer = None) -> jax.Array:
     """
     generates text
     radford et al, 2019: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
     """
-
     gen_tokens = jnp.array([], dtype=jnp.int32)
     cur_pos = 0
+    key = sampler_config.key
 
-    while cur_pos < max_new:
+    while cur_pos < sampler_config.max_tokens:
         key, subkey = jax.random.split(key, 2)
         logits = model_dict[model_name](params, model_config, tokens)
         last_token_logit = logits[-1:]
+        next_token = sample_token(last_token_logit, key=subkey, temp=sampler_config.temp, top_k=sampler_config.top_k)
 
-        next_token = sample_token(
-            last_token_logit,
-            subkey,
-            temp=temp,
-            top_k=top_k,
-        )
+        if stream and tokenizer:
+            print(tokenizer.decode(next_token), end='', flush=True)
 
         gen_tokens = jnp.concatenate((gen_tokens, next_token))
         tokens = jnp.concatenate((tokens, next_token))
         cur_pos += 1
+
+    if stream:
+        print()
 
     return gen_tokens
 
