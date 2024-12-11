@@ -53,8 +53,8 @@ def gelu_ffn(x: jax.Array, in_weight: jax.Array, in_bias: jax.Array, out_weight:
     feed-forward network with GELU used in GPT2
     """
 
-    projected_up = gelu(linear(x, in_weight, in_bias))
-    output = linear(projected_up, out_weight, out_bias)
+    projected_up = gelu(linear(x, in_weight, in_bias)) # (seq_len, embed_dim) -> (seq_len, 4 * embed_dim)
+    output = linear(projected_up, out_weight, out_bias) # (seq_len, 4 * embed_dim) -> (seq_len, embed_dim)
     return output
 
 # Attention
@@ -71,25 +71,25 @@ def multi_head_attn(x: jax.Array, w_qkv: jax.Array, b_qkv: jax.Array, w_proj: ja
     standard multi-head attention that processes input sequence in parallel, enabling attention heads to focus on different aspects of the input
     vaswani et al, 2017: https://arxiv.org/abs/1706.03762
     """
-    seq_len, embed_dim = x.shape
+    seq_len, embed_dim = x.shape # (seq_len, embed_dim)
     head_dim = embed_dim // n_head
 
-    x_qkv = jnp.dot(x, w_qkv) + b_qkv
-    x_qkv_heads = x_qkv.reshape(seq_len, 3, n_head, head_dim)
-    xq, xk, xv = x_qkv_heads[:, 0], x_qkv_heads[:, 1], x_qkv_heads[:, 2]
+    x_qkv = jnp.dot(x, w_qkv) + b_qkv # (seq_len, embed_dim) @ (embed_dim, 3 * embed_dim) -> (seq_len, 3*embed_dim) 
+    x_qkv_heads = x_qkv.reshape(seq_len, 3, n_head, head_dim) # (seq_len, 3 * embed_dim) -> (seq_len, 3, n_head, head_dim) 
+    xq, xk, xv = x_qkv_heads[:, 0], x_qkv_heads[:, 1], x_qkv_heads[:, 2] # (seq_len, 3, n_head, head_dim) -> (seq_len, n_head, head_dim)
 
-    xq = xq.transpose(1, 0, 2)
-    xkt = xk.transpose(1, 2, 0)
-    xv = xv.transpose(1, 0, 2)
+    xq = xq.transpose(1, 0, 2) # (n_head, seq_len, head_dim) 
+    xkt = xk.transpose(1, 2, 0) # (n_head, head_dim, seq_len)
+    xv = xv.transpose(1, 0, 2) # (n_head, seq_len, head_dim)
 
-    scaled_scores = jnp.matmul(xq, xkt)/ jnp.sqrt(head_dim)
-    masked_scores = jnp.where(causal_mask == 0, float('-inf'), scaled_scores)
+    scaled_scores = jnp.matmul(xq, xkt)/ jnp.sqrt(head_dim) # (n_head, seq_len, head_dim) @ (n_head, head_dim, seq_len) -> (n_head, seq_len, seq_len)
+    masked_scores = jnp.where(causal_mask == 0, float('-inf'), scaled_scores) # (n_head, seq_len, seq_len)
     attn_weights = jax.nn.softmax(masked_scores, axis=-1)
 
-    context_weights = jnp.matmul(attn_weights, xv)
-    transposed_context_weights = context_weights.transpose(1, 0, 2)
-    reshaped_context_weights = transposed_context_weights.reshape(seq_len, embed_dim)
-    token_logits = jnp.dot(reshaped_context_weights, w_proj) + b_proj
+    context_weights = jnp.matmul(attn_weights, xv) # (n_head, seq_len, seq_len) @ (n_head, seq_len, head_dim) -> (n_head, seq_len, head_dim)
+    transposed_context_weights = context_weights.transpose(1, 0, 2) # (n_head, seq_len, head_dim) -> (seq_len, n_head, head_dim)
+    reshaped_context_weights = transposed_context_weights.reshape(seq_len, embed_dim) # (seq_len, n_head, head_dim) -> (seq_len, embed_dim)
+    token_logits = jnp.dot(reshaped_context_weights, w_proj) + b_proj # (seq_len, embed_dim) @ (embed_dim, embed_dim) -> (seq_len, embed_dim)
 
     return token_logits
 
@@ -217,18 +217,18 @@ def gpt2_forward(model_params: Dict[str, Any], model_config: ModelConfig, tokens
     """
     full GPT2 forward pass, uses transformer_block
     """
-    seq_len = tokens.shape[0]
-    token_embeds = model_params['token_embedding'][tokens]
+    seq_len = tokens.shape[0] # (seq_len,)
+    token_embeds = model_params['token_embedding'][tokens] # (seq_len,) -> (seq_len, embed_dim)
     pos_embeds = model_params['positional_embedding'][:seq_len]
-    x = token_embeds + pos_embeds
+    x = token_embeds + pos_embeds 
 
     causal_mask = create_causal_mask(seq_len)
 
     for i in range(model_config.n_blocks):
-        x = transformer_block(x, model_params[f'block_{i}'], model_config, causal_mask)
+        x = transformer_block(x, model_params[f'block_{i}'], model_config, causal_mask) # (seq_len, embed_dim) -> (seq_len, embed_dim)
 
     x = layer_norm(x, model_params['lnf']['gamma'], model_params['lnf']['beta'])
-    token_logits = jnp.dot(x, model_params['output_projection'])
+    token_logits = jnp.dot(x, model_params['output_projection']) # (seq_len, embed_dim) -> (seq_len, vocab_size)
     return token_logits
 
 
