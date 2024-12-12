@@ -57,6 +57,20 @@ def gelu_ffn(x: jax.Array, in_weight: jax.Array, in_bias: jax.Array, out_weight:
     output = linear(projected_up, out_weight, out_bias) # (seq_len, 4 * embed_dim) -> (seq_len, embed_dim)
     return output
 
+def swiglu(x: jax.Array, gate_proj: jax.Array, up_proj: jax.Array, down_proj: jax.Array) -> jax.Array:
+    """
+    SwiGLU activation that combines swish gating with linear units to improve transformer performance over GELU
+    dauphin et al, 2016: https://arxiv.org/pdf/1612.08083
+    shazeer 2020: https://arxiv.org/pdf/2002.05202
+    """
+
+    gate = jax.nn.silu(jnp.dot(x, gate_proj)) # (seq_len, embed_dim) -> (seq_len, hidden_dim)
+    projected_up = jnp.dot(x, up_proj) # (seq_len, embed_dim) -> (seq_len, hidden_dim)
+    gated_output = gate * projected_up # (seq_len, hidden_dim) -> (seq_len, hidden_dim) (element-wise multiplication)
+    back_down = jnp.dot(gated_output, down_proj) # (seq_len, hidden_dim) -> (seq_len, embed_dim)
+
+    return back_down
+
 # Attention
 
 def create_causal_mask(seq_len: int):

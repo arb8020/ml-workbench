@@ -38,6 +38,9 @@ note that we don't add new parameters! the size of each head's embedding dimensi
 we create these heads simply by splitting up the initial (embed_dim, embed_dim) matrix, and concatenating the results later
 so the top half might end up being the syntactic part of attention, the bottom half might end up being the semantic part of attention, etc
 
+### grouped query attention 
+
+
 ### feedforward/fully connected network
 
 while the attention mechanism is powerful, giving us the context of what tokens to pay attention to
@@ -49,6 +52,29 @@ then, we apply the activation functions, learn complex relations, and then compr
 so now we have a neat little cycle we apply over and over again
 learn relations between tokens -> learn about each token's meaning
 so we combine both cross-token interaction, and the power of deep learning
+
+### swiglu
+our gelu activation feedforward network only applies a nonlinearity in one step (after projecting into the 4x embed_dim space)
+but deep networks like ours have a decent amount of sources of instability
+kind of like with residual connections, we want ways to more easily propagate gradients back through our networks
+since these feedforward networks are where a good deal of our token processing occurs, its an important step
+taking ideas from LSTMs and RNNs (out of scope), another way to apply nonlinearities to our input is through a gating mechanism combined with a linear unit
+our linear unit works as normal, applying a transformation and a shift
+but rather than directly transforming the whole thing with a nonlinearity like gelu
+in parallel, we do another linear transformation with an activation function like sigmoid
+and apply an elementwise multiplication, rather than a dot product
+so the nonlinearity kind of gets applied like a mask onto the linear layer that was computed in parallel
+now, rather than applying the nonlinearity directly to the higher dimensionalized input
+we learn two different projections into the hidden dimension, one meant for processing and one meant for controlling or 'gating' that processing
+as an example, the gate matrix might be completely mapped between (0,1) if using an activation function like sigmoid (one of the first ones used in deep learning!)
+and then applying this gate matrix elementwise sort of turns on and off different parts of that projected input, still a nonlinearity being introduced but in a new way
+this makes it a lot easier to flow gradients back through the network, because the linear layer preserves information and the gating controls what we care about, separately
+these layers, Gated Linear Units, have been shown to be quite effective when dropped in for the usual feedforward networks
+the best one uses an activation function called swish, which is sigmoid(x) * x
+interestingly, using sigmoid(x) * x is kind of like self attention, the input itself determines its own gating process, which works quite well empirically
+
+as for intuitions on why this performs better empirically, noam shazeer literally says the following in the paper where he introduced using SwiGLU in transformers:
+"we offer no explanation as to why these architectures seem to work; we attribute their success, as all else, to divine benevolence"
 
 ## activation functions
 
@@ -74,6 +100,10 @@ mathematically, we might be getting some weirdly skewed or shifted values from o
 so we just take our distribution from the most recent layer, and we normalize it into mean 0 and variance 1
 we also allow the model to take an affine transformation (scale/shift) on that distribution, in case something different works better for the model
 this has been found to smooth out the loss surface and make it easier for the model to learn
+
+### rms norm
+
+
 
 ### residual connections
 
@@ -174,6 +204,10 @@ C = -sum(p(x) * log(q(x)))
 this is known as 'cross-entropy', as its the entropy 'across' two distributions
 note that we choose to put the log transform on our q distribution bc log(0) is not stable
 
+### perplexity
+
+TODO: 
+
 ## optimizers
 
 ### stochastic gradient descent
@@ -206,6 +240,8 @@ as a side note, the initial values of mean/squared mean will be 0 when initializ
 
 ## tokenization
 
+### byte pair encoding
+
 our model unfortunately does not have the ability to take in raw strings, as words are not math
 you may think 'oh lets just take the ascii/unicode value of each character' but there are some problems with this
 the most clear framing is the context length of the model
@@ -222,3 +258,9 @@ let's tag this pair of bytes with a new value, say 256 (after 255)
 now, we can go back through our data and find the next most common pair of bytes, and compress them into another new value, say 257
 repeatedly applying this process until we get to some desired vocab_size, or sufficient compression, we can efficiently represent some training data
 this is known as byte pair encoding. the current codebase implements a rudimentary/slow version of it, but theres a lot of room for optimization in the future
+
+## positional encoding
+
+### rope
+
+### scaled rope
