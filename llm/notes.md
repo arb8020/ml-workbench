@@ -54,6 +54,7 @@ learn relations between tokens -> learn about each token's meaning
 so we combine both cross-token interaction, and the power of deep learning
 
 ### swiglu
+
 our gelu activation feedforward network only applies a nonlinearity in one step (after projecting into the 4x embed_dim space)
 but deep networks like ours have a decent amount of sources of instability
 kind of like with residual connections, we want ways to more easily propagate gradients back through our networks
@@ -103,7 +104,10 @@ this has been found to smooth out the loss surface and make it easier for the mo
 
 ### rms norm
 
-
+some researchers realized that layer norm is cool but honestly most of the value comes from the re-scaling to some learnable gamma, not the re-centering
+so they scaled the inputs using the root mean square, effectively re-scaling without re-centering, and saving computational resources
+and kept around the learnable scale parameter gamma
+empirically was proven to be computationally cheaper and retained performance, so is now frequently used over layer norm
 
 ### residual connections
 

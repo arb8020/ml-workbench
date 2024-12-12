@@ -40,6 +40,15 @@ def layer_norm(x: jax.Array, gamma: jax.Array, beta: jax.Array, eps: float = 1e-
     normalized_x = (x - mean) / jnp.sqrt(variance + eps)
     return gamma * normalized_x + beta
 
+def rms_norm(x: jax.Array, gamma: jax.Array, eps: float = 1e-5) -> jax.Array:
+    """
+    zhang/sennrich 2019: https://arxiv.org/abs/1910.07467
+    re-centering invariance in layernorm not necessary, just uses root mean square to regularize a layer, computationally cheaper, also one less param to learn
+    """
+    mean_square = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
+    x_norm = x * jax.lax.rsqrt(mean_square + eps) # rsqrt -> 1/jnp.sqrt
+    return gamma * x_norm
+
 # Layers
 
 def linear(x: jax.Array, weight: jax.Array, bias: jax.Array) -> jax.Array:
