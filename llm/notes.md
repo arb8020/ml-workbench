@@ -265,6 +265,69 @@ this is known as byte pair encoding. the current codebase implements a rudimenta
 
 ## positional encoding
 
-### rope
+### gpt-2
+
+our gpt2 model learns how to distinguish positions with a learned embedding matrix
+we simply add the matrix that we got from taking the dot product of our tokens and our token embedding matrix
+to a learnable positional embedding matrix, that was of size (context_len, embed_dim), taking just the slice up to seq_len (pos_embed[:seq_len])
+
+### rotary positional encoding (RoPE)
+
+while the gpt-2 way of doing positional encoding was simple
+it was unfortunately flawed
+remember that the output of the positional encoding matrix was directly added to the token embedding matrix
+it might be important context to pay attention to, that 'hello' is the first word of the sentence (hello there!)
+maybe signaling a greeting, rather than at the end, where 'hello' may signal confusion (um, hello?)
+but the positional embeddings we've added are kind of polluting the signal of what 'hello' means
+because we add the positional encoding matrix, it means something different depending on where in the context length it is
+but this is a fixed size, and this doesn't really work well with variable sentence lengths
+as an example, how is our model supposed to know that hello at the end of a 8 long sentence has a similar meaning to hello at the end of a 64 long sentence?
+so we want an encoding strategy that is relative to position within a sequence's length, rather than absolute
+but will dot products will maintain relative positional encoding?
+let r_ij be the positional encoding for some distance index j to index i
+let e_i, e_j be the token embeddings for tokens at indices j/i
+and let q_, k_ denote the query/key vectors
+so in our example, we have that the query vector for token at index i is
+q_i = e_i + r_{ij} 
+and the key vector for token at index j is k_j = e_j (since the distance from j to j is 0)
+taking the dot product of the q and k, as we do
+dot(q_i, k_j) = dot(e_i + r_ij, e_j)
+which expands out into
+dot(q_i, k_j) = dot(e_i, e_j) + dot(r_ij, e_j)
+so we still have the information of just the dot product between the embedding vectors
+how can we come up with a way to encode position with a dot product?
+
+the core idea in rotary positional encoding is we can avoid polluting the token embedding with absolute positional info
+and effectively split up the token embedding from the positional encoding using complex numbers
+remember that a complex number introduces an imaginary axis orthogonal to the real number line
+we write a complex number as $z = a + bi$, at point $(a,b)$ on this new 2D axis
+we can also express it as a magnitude away from the origin, and an angle from the real axis
+where the magnitude would be $r = \sqrt{a^2+b^2}$
+and the angle would be $\cos(\theta) + i\sin(\theta)$
+where we can find the angle using the inverse of the tangent function on the values $a$ and $b$
+using euler's formula, we now rewrite $z = a + bi$ as $z = re^{i\theta}
+for us, this means that we want to represent our token embedding as the magnitude of this complex number
+and we can have the angle be related to the position
+so any tokens close together have a small amount of radians between them, and tokens far apart are separated by a larger angle, or more rotations
+but they still maintain their magnitude/individual token information!
+
+quick note, you may realize $i * m\theta$ has very fast oscillations/frequencies for larger values of $m-n$ (where m, n are indices)
+so we should use different theta values for different embedding dimension sizes
+this allows us to capture shorter and longer range dependencies
+like in the 0th dimension, we would have the highest $\theta$ value
+and it would decrease for larger and larger dimensions
+to accomplish this, we set $\theta_j = 1+e4^{-2j/d}$ where $j$ is the index of the embedding dimension
+this gives us log scaling across the embedding dimensions
+
+to code this, we need to turn our xq, xk vectors into complex numbers
+note that we apply rope to each head individually, since each head learns different relations between tokens
+we first split xq/xk into real/imaginary parts arbitrarily by cutting them in half, reshaping into (..., 2)
+then we use the .complex from jax to turn it into a complex number
+multiply by our dimension index scaling frequency for faster/slower oscillations
+remember this only depends on embed_dim and the seq_len so we usually precompute those matrices
+then we extract back the real/imaginary parts of the vectors with our numerical computing library functions 
+and concatenate the vector back from (..., 2) back to how it was before
 
 ### scaled rope
+
+todo

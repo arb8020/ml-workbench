@@ -80,7 +80,49 @@ def swiglu(x: jax.Array, gate_proj: jax.Array, up_proj: jax.Array, down_proj: ja
 
     return back_down
 
-# Attention
+# Positional Encoding
+
+def apply_rotary_emb(xq: jax.Array, xk: jax.Array, rotation_matrices: jax.Array) -> Tuple[jax.Array, jax.Array]:
+    """
+    applies rotary position embeddings to queries/keys by rotating vector pairs to encode relative positions while preserving token similarity
+    works by splitting vectors into real/imaginary and using theta for position encoding and semantic meaning in magnitude 
+    think abt polar form trickery
+    su et al, 2021: https://arxiv.org/abs/2104.09864
+    """
+    # split into real/imaginary pairs
+    reshape_xq = xq.reshape(*xq.shape[:-1], -1, 2) 
+    reshape_xk = xk.reshape(*xk.shape[:-1], -1, 2)
+    # convert pairs to z = a + bi
+    complex_xq = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
+    complex_xk = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
+    # apply rotation angle matrix
+    rotated_xq = complex_xq * rotation_matrices[:, None, :]
+    rotated_xk = complex_xk * rotation_matrices[:, None, :]
+    # convert back to real number, concatenate real/imaginary part
+    xq_out = jnp.stack((jnp.real(rotated_xq), jnp.imag(rotated_xq)), axis=-1).reshape(*rotated_xq.shape[:-1], -1)
+    xk_out = jnp.stack((jnp.real(rotated_xk), jnp.imag(rotated_xk)), axis=-1).reshape(*rotated_xk.shape[:-1], -1)
+    return xq_out, xk_out
+    
+    return jax.vmap(adjust_frequency)(raw_frequencies)
+
+def initialize_rotation_matrices(dim: int, seq_len: int, theta: float = 500000.0):
+    """
+    precomputes complex rotation matrices for RoPE to avoid redundant computation during attention
+    captures range of patterns by using diff frequencies depending on the embedding dimension's index
+    su et al, 2021: https://arxiv.org/abs/2104.09864
+    """
+    # early dim -> high freq -> rotates fast -> local patterns
+    # later dim -> low freq -> rotates slow -> global patterns
+    frequencies = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)] / dim))
+    
+    # NTK aware scaling (todo)
+    
+    # multiply each pos by each frequency
+    positions = jnp.arange(seq_len)
+    frequencies = jnp.outer(positions, frequencies)
+    
+    # convert to complex rotation matrix with euler's formula
+    return jnp.exp(1j * frequencies) # 1j is the imaginary unit
 
 def create_causal_mask(seq_len: int):
     """
@@ -88,6 +130,8 @@ def create_causal_mask(seq_len: int):
     vaswani et al, 2017: https://arxiv.org/abs/1706.03762
     """
     return jnp.tril(jnp.ones((seq_len, seq_len)))
+
+# Attention
 
 def multi_head_attn(x: jax.Array, w_qkv: jax.Array, b_qkv: jax.Array, w_proj: jax.Array, b_proj: jax.Array, n_head: int, causal_mask: jax.Array) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
     """
