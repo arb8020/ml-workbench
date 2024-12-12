@@ -450,4 +450,51 @@ def generate(params: Dict, model_config: ModelConfig, model_name: str, tokens: j
 
     return gen_tokens
 
+# Evaluation
+
+class EvalConfig(NamedTuple):
+    seq_len: int = 1024
+    stride: int = 512
+         
+@partial(jax.jit, static_argnames=['model_config', 'model_name', 'eval_config'])
+def sliding_ppl_eval_step(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, start_idx: int, eval_config: EvalConfig) -> float:
+    """
+    jit-compiled perplexity evaluation step
+    """
+    input_seq = jax.lax.dynamic_slice(tokens, (start_idx,), (eval_config.seq_len,))
+    target_seq = jax.lax.dynamic_slice(tokens, (start_idx + 1,), (eval_config.seq_len,))
+    
+    logits = model_dict[model_name](params, model_config, input_seq)
+    loss = cross_entropy_loss(logits, target_seq)
+    return loss
+
+    return perplexity
+
+def eval_perplexity(params: Dict, model_config: ModelConfig, model_name: str, tokens: jnp.ndarray, eval_config: EvalConfig = EvalConfig()):
+    """
+    evaluates model perplexity with sliding window
+    huggingface: https://github.com/huggingface/transformers/blob/main/docs/source/en/perplexity.md
+    """
+    if model_name not in model_dict:
+        raise ValueError(f"Unknown model: {model_name}")
+        
+    device = jax.devices()[0]
+    params = jax.device_put(params, device)
+    tokens = jax.device_put(tokens, device)
+    
+    print('evaluating perplexity...')
+    total_loss = 0.0
+    total_tokens = 0
+    
+    for start_idx in range(0, len(tokens) - eval_config.seq_len, eval_config.stride):
+        loss = sliding_ppl_eval_step(params, model_config, model_name, tokens, start_idx, eval_config)
+        total_loss += loss * eval_config.seq_len 
+        total_tokens += eval_config.seq_len
+        
+    avg_loss = total_loss / total_tokens
+    perplexity = jnp.exp(avg_loss)
+    print(f'perplexity: {perplexity}')
+    
+    return perplexity
+
 model_dict = {'gpt2': gpt2_forward}

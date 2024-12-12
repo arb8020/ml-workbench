@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 from model import ModelConfig, gpt2_forward, init_gpt2_params
 from training import (
-    AdamConfig, DatasetConfig, TrainConfig, Tokenizer, batch_forward, prepare_dataset, create_random_batches,
+    AdamConfig, DatasetConfig, TrainConfig, SamplerConfig, EvalConfig, eval_perplexity, Tokenizer, batch_forward, prepare_dataset, create_random_batches,
     cross_entropy_loss, train, generate, encode, decode, learn_bpe
 )
 
@@ -163,22 +163,36 @@ def test_generation(small_model_config, sample_text, simple_tokenizer):
     tokens = prepare_dataset(sample_text, simple_tokenizer)[:4] 
     prompt_tokens = tokens.reshape(-1) # make sure one dim 
     
-    generated = generate(
+    sampler_config = SamplerConfig(max_tokens=8, key=key)
+    generated = generate(params, small_model_config, "gpt2", prompt_tokens, sampler_config)
+    
+    assert isinstance(generated, jax.Array)
+    assert generated.shape[0] == 8  # should generate requested number of tokens
+    assert jnp.all(generated < small_model_config.vocab_size)  # ensure valid token ids
+
+def test_perplexity_eval(small_model_config, sample_text, simple_tokenizer):
+    """test perplexity evaluation"""
+    
+    tokens = prepare_dataset(sample_text, simple_tokenizer)
+    key = jax.random.PRNGKey(0)
+    params = init_gpt2_params(key, small_model_config)
+    
+    eval_config = EvalConfig(seq_len=8, stride=4)  
+    
+    ppl = eval_perplexity(
         params,
         small_model_config,
         "gpt2",
-        prompt_tokens,
-        max_new=10,
-        key=key
+        tokens,
+        eval_config
     )
     
-    assert isinstance(generated, jax.Array)
-    assert generated.shape[0] == 10  # should generate requested number of tokens
-    assert jnp.all(generated < small_model_config.vocab_size)  # ensure valid token ids
+    assert isinstance(ppl, jax.Array)
+    assert ppl.ndim == 0  
+    assert ppl >= 1.0  
 
 def test_end_to_end(small_model_config, train_config, opt_config, sample_text, simple_tokenizer):
-    """test full workflow: data → training → generation"""
-
+    """test full workflow: data → training → generation → evaluation"""
     # prepare data
     tokens = prepare_dataset(sample_text, simple_tokenizer) 
     
@@ -197,17 +211,23 @@ def test_end_to_end(small_model_config, train_config, opt_config, sample_text, s
         key=key
     )
     
-    # generate from trained model
-    prompt_tokens = tokens[:4]
-
-    generated = generate(
+    # evaluate perplexity
+    eval_config = EvalConfig(seq_len=8, stride=4)
+    ppl = eval_perplexity(
         trained_params,
         small_model_config,
         "gpt2",
-        prompt_tokens,
-        max_new=8,
-        key=key
+        tokens,
+        eval_config
     )
+    assert isinstance(ppl, jax.Array)
+    assert ppl.ndim == 0
+    assert ppl >= 1.0
+    
+    # generate from trained model
+    prompt_tokens = tokens[:4]
+    sampler_config = SamplerConfig(max_tokens=8, key=key)
+    generated = generate(params, small_model_config, "gpt2", prompt_tokens, sampler_config)
     
     assert isinstance(generated, jax.Array)
     assert generated.shape[0] == 8
