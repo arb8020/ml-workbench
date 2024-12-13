@@ -91,6 +91,8 @@ class ModelConfig(NamedTuple):
     context_len: int
     n_head: int
     n_blocks: int
+    n_kv_head: Optional[int] = None
+    
 
 def init_gpt2_params(key, model_config: ModelConfig, scaling_factor: float = 0.02) -> Dict[str, Any]:
     """
@@ -258,42 +260,60 @@ def create_causal_mask(seq_len: int, start_pos: int = 0):
 # Attention
 
 class KVCache(NamedTuple):
-    keys: jax.Array    # (n_blocks, seq_len, n_head, head_dim) 
+    """
+    grouped query attention, allows for a flexible amount of kv_heads (queries attend to groups of k/v tensors)
+    finds a middle ground between multi-head attention performance and managing memory bandwidth of reloading k/v tensors in kv cached inference
+    ainslie et al, 2023: https://arxiv.org/pdf/2305.13245
+    """
+    keys: jax.Array    # (n_blocks, seq_len, n_head, head_dim)
     values: jax.Array  # (n_blocks, seq_len, n_head, head_dim)
     
     @classmethod
     def init(cls, model_config: ModelConfig) -> 'KVCache':
-        shape = (model_config.n_blocks, model_config.context_len, model_config.n_head, model_config.embedding_dim // model_config.n_head)
+
+        if model_config.n_kv_head is not None:
+            cache_heads = model_config.n_kv_head
+        else:
+            cache_heads = model_config.n_head
+        shape = (model_config.n_blocks, model_config.context_len, cache_heads, model_config.embedding_dim // model_config.n_head)
+
         return cls(keys=jnp.zeros(shape), values=jnp.zeros(shape))
     
-    def update(self, xk: jax.Array, xv: jax.Array, block_idx: int, cur_pos: int) -> 'KVCache':
+    def update(self, xk: jax.Array, xv: jax.Array, block_idx: int, cur_pos: int, n_rep: int = 1) -> 'KVCache':
         cached_keys = jax.lax.dynamic_update_slice(self.keys, xk[None, ...], (block_idx, cur_pos, 0, 0)) # add block dim
         cached_values = jax.lax.dynamic_update_slice(self.values, xv[None, ...],  (block_idx, cur_pos, 0, 0))
 
-        return cached_keys, cached_values, KVCache(keys=cached_keys, values=cached_values)
+        keys = jnp.repeat(cached_keys[block_idx], n_rep, axis=1) # repeat across head dim for grouped query attention
+        values = jnp.repeat(cached_values[block_idx], n_rep, axis=1)
 
-def multi_head_attn(x: jax.Array, w_qkv: jax.Array, b_qkv: jax.Array, w_proj: jax.Array, b_proj: jax.Array, n_head: int, causal_mask: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
+        return keys, values, KVCache(keys=cached_keys, values=cached_values)
+
+def grouped_query_attn(x: jax.Array, w_qkv: jax.Array, b_qkv: jax.Array, w_proj: jax.Array, b_proj: jax.Array, model_config: ModelConfig, causal_mask: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
     """
-    standard multi-head attention that processes input sequence in parallel, enabling attention heads to focus on different aspects of the input
+    standard attention that processes input sequence in parallel, enabling attention heads to focus on different aspects of the input
     vaswani et al, 2017: https://arxiv.org/abs/1706.03762
     """
 
     seq_len, embed_dim = x.shape
 
-    head_dim = embed_dim // n_head
+    head_dim = embed_dim // model_config.n_head
+    if model_config.n_kv_head is not None:
+        n_rep = model_config.n_head // model_config.n_kv_head
+    else:
+        n_rep = 1
 
     x_qkv = jnp.dot(x, w_qkv) + b_qkv 
-    x_qkv_heads = x_qkv.reshape(seq_len, 3, n_head, head_dim)
+    x_qkv_heads = x_qkv.reshape(seq_len, 3, model_config.n_head, head_dim)
     xq, xk, xv = x_qkv_heads[:, 0], x_qkv_heads[:, 1], x_qkv_heads[:, 2] 
    
     if kv_cache is not None:
-        xk, xv, kv_cache = kv_cache.update(xk, xv, block_idx, cur_pos)
-        xk = xk[block_idx, :cur_pos + seq_len]
-        xv = xv[block_idx, :cur_pos + seq_len]
+        xk, xv, kv_cache = kv_cache.update(xk, xv, block_idx, cur_pos, n_rep)
+        xk = xk[:cur_pos + seq_len]
+        xv = xv[:cur_pos + seq_len]
     
-    xq = xq.transpose(1, 0, 2) 
-    xkt = xk.transpose(1, 2, 0) 
-    xv = xv.transpose(1, 0, 2) 
+    xq = xq.transpose(1, 0, 2)
+    xkt = xk.transpose(1, 2, 0)
+    xv = xv.transpose(1, 0, 2)
 
     scaled_scores = jnp.matmul(xq, xkt)/ jnp.sqrt(head_dim) 
 
@@ -344,13 +364,13 @@ def transformer_block(x: jax.Array, block_params: Dict[str, Dict[str, jax.Array]
     residual = x
     normed_x = layer_norm(x, block_params['ln1']['gamma'], block_params['ln1']['beta'])
 
-    context, kv_cache = multi_head_attn(
+    context, kv_cache = grouped_query_attn(
         normed_x,
         block_params['attn_in']['weight'],
         block_params['attn_in']['bias'],
         block_params['attn_out']['weight'],
         block_params['attn_out']['bias'],
-        model_config.n_head,
+        model_config,
         causal_mask,
         cur_pos=cur_pos,
         block_idx=block_idx,

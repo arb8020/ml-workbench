@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from transformers import GPT2Config, GPT2LMHeadModel
 from typing import Dict, Tuple, Any
-from model import ModelConfig, gpt2_forward, gelu_exact, layer_norm, multi_head_attn, create_causal_mask
+from model import ModelConfig, gpt2_forward, gelu_exact, layer_norm, grouped_query_attn, create_causal_mask
 from training import (
     init_optimizer, AdamConfig, SGDConfig, MomentumConfig, 
     adamw_update, sgd_update, momentum_update
@@ -239,7 +239,7 @@ def test_attention_equivalence(models):
     block_params = jax_params[f'block_{block_idx}']
 
     jax_output, _ = jax.vmap(
-        multi_head_attn,
+        grouped_query_attn,
         in_axes=(0, None, None, None, None, None, None, None)  
     )(
         x,
@@ -247,7 +247,7 @@ def test_attention_equivalence(models):
         block_params['attn_in']['bias'],
         block_params['attn_out']['weight'],
         block_params['attn_out']['bias'],
-        config.n_head,
+        config,
         causal_mask,
         block_idx
     )
