@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from typing import NamedTuple, Dict, Callable, Any, Tuple, Optional, Union
 from functools import partial
-from model import ModelConfig, gpt2_forward
+from model import ModelConfig, gpt2_forward, gpt2_forward_kv, create_causal_mask_kv, KVCache
 
 # Tokenization
 
@@ -437,7 +437,6 @@ def generate(params: Dict, model_config: ModelConfig, model_name: str, tokens: j
         logits = model_dict[model_name](params, model_config, tokens)
         last_token_logit = logits[-1:]
         next_token = sample_token(last_token_logit, sampler_config)
-
         if stream and tokenizer:
             print(tokenizer.decode(next_token), end='', flush=True)
 
@@ -447,7 +446,46 @@ def generate(params: Dict, model_config: ModelConfig, model_name: str, tokens: j
 
     if stream:
         print()
+    
+    print(f'generated: {len(gen_tokens)} tokens')
+    return gen_tokens
 
+def generate_kv(params: Dict[str, Any], model_config: ModelConfig, model_name, tokens: jax.Array, sampler_config: SamplerConfig, stream: bool = True, tokenizer: Tokenizer = None) -> jax.Array:
+    """
+    generates text with kv caching
+    radford et al, 2019: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+    """
+    
+    gen_tokens = jnp.array([], dtype=jnp.int32)
+    cur_pos = 0
+    seq_len = tokens.shape[0]
+
+    kv_cache = KVCache.init(model_config)
+    causal_mask = create_causal_mask_kv(seq_len, cur_pos)
+
+    logits, kv_cache = model_dict[model_name](params, model_config, tokens, causal_mask, cur_pos=cur_pos, kv_cache=kv_cache)
+
+    next_token = sample_token(logits[-1:], sampler_config)
+    gen_tokens = jnp.concatenate((gen_tokens, next_token))
+    tokens = jnp.concatenate((tokens, next_token))
+
+    cur_pos = seq_len
+
+    while cur_pos < sampler_config.max_tokens:
+        logits, kv_cache = model_dict[model_name](params, model_config, next_token, causal_mask=causal_mask, cur_pos=cur_pos, kv_cache=kv_cache)
+        
+        next_token = sample_token(logits[-1:], sampler_config)
+        if stream and tokenizer:
+            print(tokenizer.decode(next_token), end='', flush=True)
+            
+        gen_tokens = jnp.concatenate((gen_tokens, next_token))
+        tokens = jnp.concatenate((tokens, next_token))
+        cur_pos += 1
+
+    if stream:
+        print()
+    
+    print(f'generated: {len(gen_tokens)} tokens')
     return gen_tokens
 
 # Evaluation
@@ -497,4 +535,4 @@ def eval_perplexity(params: Dict, model_config: ModelConfig, model_name: str, to
     
     return perplexity
 
-model_dict = {'gpt2': gpt2_forward}
+model_dict = {'gpt2': gpt2_forward, 'gpt2_kv': gpt2_forward_kv}
