@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 from transformers import GPT2Config, GPT2LMHeadModel
 from typing import Dict, Tuple, Any
-from model import ModelConfig, gpt2_forward, gelu_exact, layer_norm, multi_head_attn
+from model import ModelConfig, gpt2_forward, gelu_exact, layer_norm, multi_head_attn, create_causal_mask
 from training import (
     init_optimizer, AdamConfig, SGDConfig, MomentumConfig, 
     adamw_update, sgd_update, momentum_update
@@ -230,7 +230,7 @@ def test_attention_equivalence(models):
     x = jnp.array(np.random.randn(batch_size, seq_len, config.embedding_dim))
     torch_x = convert_jax_to_torch(x)
 
-    causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+    causal_mask = create_causal_mask(seq_len)
     
     torch_mask = torch.tril(torch.ones(seq_len, seq_len))
     torch_mask = torch_mask.masked_fill(torch_mask == 0, float('-inf'))
@@ -238,9 +238,9 @@ def test_attention_equivalence(models):
 
     block_params = jax_params[f'block_{block_idx}']
 
-    jax_output = jax.vmap(
+    jax_output, _ = jax.vmap(
         multi_head_attn,
-        in_axes=(0, None, None, None, None, None, None)  
+        in_axes=(0, None, None, None, None, None, None, None)  
     )(
         x,
         block_params['attn_in']['weight'],
@@ -248,7 +248,8 @@ def test_attention_equivalence(models):
         block_params['attn_out']['weight'],
         block_params['attn_out']['bias'],
         config.n_head,
-        causal_mask
+        causal_mask,
+        block_idx
     )
 
     torch_block = torch_model.transformer.h[block_idx]
@@ -267,8 +268,8 @@ def test_full_forward_pass(models, sample_input):
     """test that full model forward pass matches PyTorch."""
     jax_params, config, torch_model = models
     jax_tokens, torch_tokens = sample_input
-    
-    jax_output = gpt2_forward(jax_params, config, jax_tokens)
+    causal_mask = create_causal_mask(len(jax_tokens))
+    jax_output, _ = gpt2_forward(jax_params, config, jax_tokens, causal_mask)
     
     with torch.no_grad():
         torch_output = torch_model(torch_tokens).logits
@@ -384,8 +385,10 @@ def test_numerical_stability(models):
     
     large_tokens = jnp.array([config.vocab_size-1] * 8)
     torch_large_tokens = torch.tensor([config.vocab_size-1] * 8)
+
+    causal_mask = create_causal_mask(len(large_tokens))
     
-    jax_output = gpt2_forward(jax_params, config, large_tokens)
+    jax_output, _ = gpt2_forward(jax_params, config, large_tokens, causal_mask)
     with torch.no_grad():
         torch_output = torch_model(torch_large_tokens).logits
     
@@ -398,8 +401,10 @@ def test_numerical_stability(models):
     
     zero_tokens = jnp.zeros(8, dtype=jnp.int32)
     torch_zero_tokens = torch.zeros(8, dtype=torch.long)
-    
-    jax_output = gpt2_forward(jax_params, config, zero_tokens)
+
+    causal_mask = create_causal_mask(len(zero_tokens))
+
+    jax_output, _ = gpt2_forward(jax_params, config, zero_tokens, causal_mask)
     with torch.no_grad():
         torch_output = torch_model(torch_zero_tokens).logits
     

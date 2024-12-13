@@ -123,7 +123,7 @@ def test_model_architecture(small_model_config, sample_text, simple_tokenizer):
     batch_tokens, _ = create_random_batches(tokens, batch_size, seq_len, subkey)
     
     # test forward pass
-    logits = batch_forward(params, small_model_config, "gpt2", batch_tokens)
+    logits, _ = batch_forward(params, small_model_config, "gpt2", batch_tokens)
     expected_shape = (batch_size, seq_len, small_model_config.vocab_size)
     assert logits.shape == expected_shape
 
@@ -167,7 +167,7 @@ def test_generation(small_model_config, sample_text, simple_tokenizer):
     generated = generate(params, small_model_config, "gpt2", prompt_tokens, sampler_config)
     
     assert isinstance(generated, jax.Array)
-    assert generated.shape[0] == 8  # should generate requested number of tokens
+    assert generated.shape[0] == (sampler_config.max_tokens-len(prompt_tokens)+1)  # should generate requested number of tokens
     assert jnp.all(generated < small_model_config.vocab_size)  # ensure valid token ids
 
 def test_perplexity_eval(small_model_config, sample_text, simple_tokenizer):
@@ -230,5 +230,5 @@ def test_end_to_end(small_model_config, train_config, opt_config, sample_text, s
     generated = generate(params, small_model_config, "gpt2", prompt_tokens, sampler_config)
     
     assert isinstance(generated, jax.Array)
-    assert generated.shape[0] == 8
+    assert generated.shape[0] == (sampler_config.max_tokens-len(prompt_tokens)+1)
     assert jnp.all(generated < small_model_config.vocab_size)

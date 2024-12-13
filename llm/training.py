@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from typing import NamedTuple, Dict, Callable, Any, Tuple, Optional, Union
 from functools import partial
-from model import ModelConfig, gpt2_forward, gpt2_forward_kv, create_causal_mask_kv, KVCache
+from model import ModelConfig, gpt2_forward, create_causal_mask, KVCache
 
 # Tokenization
 
@@ -318,8 +318,8 @@ def batch_forward(params: Dict, model_config: Dict, model_name: str, input_batch
     """
     automatically vectorizes a specified model forward pass
     """ 
-
-    return jax.vmap(lambda x: model_dict[model_name](params, model_config, x))(input_batch)
+    causal_mask = create_causal_mask(input_batch.shape[1])
+    return jax.vmap(lambda x: model_dict[model_name](params, model_config, x, causal_mask=causal_mask))(input_batch)
 
 @partial(jax.jit, static_argnames=['train_config', 'model_config', 'model_name', 'opt_name'])
 def train_step(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, opt_state: OptimizerState, opt_config: OptConfig, opt_name: str, train_config: TrainConfig, key: jax.random.PRNGKey) -> Tuple[Dict, OptimizerState, float]:
@@ -329,7 +329,7 @@ def train_step(params: Dict, model_config: ModelConfig, model_name: str, tokens:
     """
 
     def batch_loss_fn(params, input_batch, target_batch):
-        logits = batch_forward(params, model_config, model_name, input_batch)
+        logits, _ = batch_forward(params, model_config, model_name, input_batch)
         batch_loss = cross_entropy_loss(logits, target_batch)
         return batch_loss
 
@@ -423,34 +423,7 @@ def sample_token(logits: jax.Array, sampler_config: SamplerConfig) -> jax.Array:
         
     return jax.random.categorical(sampler_config.key, scaled_logits)
 
-def generate(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, sampler_config: SamplerConfig, stream: bool = True, tokenizer: Tokenizer = None) -> jax.Array:
-    """
-    generates text
-    radford et al, 2019: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
-    """
-    gen_tokens = jnp.array([], dtype=jnp.int32)
-    cur_pos = 0
-    key = sampler_config.key
-
-    while cur_pos < sampler_config.max_tokens:
-        key, subkey = jax.random.split(key, 2)
-        logits = model_dict[model_name](params, model_config, tokens)
-        last_token_logit = logits[-1:]
-        next_token = sample_token(last_token_logit, sampler_config)
-        if stream and tokenizer:
-            print(tokenizer.decode(next_token), end='', flush=True)
-
-        gen_tokens = jnp.concatenate((gen_tokens, next_token))
-        tokens = jnp.concatenate((tokens, next_token))
-        cur_pos += 1
-
-    if stream:
-        print()
-    
-    print(f'generated: {len(gen_tokens)} tokens')
-    return gen_tokens
-
-def generate_kv(params: Dict[str, Any], model_config: ModelConfig, model_name, tokens: jax.Array, sampler_config: SamplerConfig, stream: bool = True, tokenizer: Tokenizer = None) -> jax.Array:
+def generate(params: Dict[str, Any], model_config: ModelConfig, model_name, tokens: jax.Array, sampler_config: SamplerConfig, stream: bool = True, tokenizer: Tokenizer = None) -> jax.Array:
     """
     generates text with kv caching
     radford et al, 2019: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
@@ -461,7 +434,7 @@ def generate_kv(params: Dict[str, Any], model_config: ModelConfig, model_name, t
     seq_len = tokens.shape[0]
 
     kv_cache = KVCache.init(model_config)
-    causal_mask = create_causal_mask_kv(seq_len, cur_pos)
+    causal_mask = create_causal_mask(seq_len, cur_pos)
 
     logits, kv_cache = model_dict[model_name](params, model_config, tokens, causal_mask, cur_pos=cur_pos, kv_cache=kv_cache)
 
@@ -501,8 +474,9 @@ def sliding_ppl_eval_step(params: Dict, model_config: ModelConfig, model_name: s
     """
     input_seq = jax.lax.dynamic_slice(tokens, (start_idx,), (eval_config.seq_len,))
     target_seq = jax.lax.dynamic_slice(tokens, (start_idx + 1,), (eval_config.seq_len,))
+    causal_mask = create_causal_mask(eval_config.seq_len)
     
-    logits = model_dict[model_name](params, model_config, input_seq)
+    logits, _ = model_dict[model_name](params, model_config, input_seq, causal_mask)
     loss = cross_entropy_loss(logits, target_seq)
     return loss
 
@@ -535,4 +509,4 @@ def eval_perplexity(params: Dict, model_config: ModelConfig, model_name: str, to
     
     return perplexity
 
-model_dict = {'gpt2': gpt2_forward, 'gpt2_kv': gpt2_forward_kv}
+model_dict = {'gpt2': gpt2_forward}

@@ -48,7 +48,7 @@ def run_cli():
             
             input_tokens = np.array(tokenizer.encode(prompt))
             
-            output_tokens = generate(
+            output_tokens = generate_kv(
                 params,
                 model_config,
                 'gpt2',
