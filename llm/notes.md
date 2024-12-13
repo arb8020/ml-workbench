@@ -41,6 +41,8 @@ so the top half might end up being the syntactic part of attention, the bottom h
 ### grouped query attention 
 
 
+
+
 ### feedforward/fully connected network
 
 while the attention mechanism is powerful, giving us the context of what tokens to pay attention to

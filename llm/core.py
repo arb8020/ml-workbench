@@ -80,127 +80,6 @@ def swiglu(x: jax.Array, gate_proj: jax.Array, up_proj: jax.Array, down_proj: ja
 
     return back_down
 
-# Model Parameters
-
-class ModelConfig(NamedTuple):
-    """
-    defines model architecture parameters for easy initialization and modification of model variants
-    """
-    vocab_size: int
-    embedding_dim: int
-    context_len: int
-    n_head: int
-    n_blocks: int
-    n_kv_head: Optional[int] = None
-    
-
-def init_gpt2_params(key, model_config: ModelConfig, scaling_factor: float = 0.02) -> Dict[str, Any]:
-    """
-    template for initializing parameters of a GPT2 style transformer model
-    vaswani et al, 2017: https://arxiv.org/abs/1706.03762
-    """
-    keys = jax.random.split(key, 7 + 10 * model_config.n_blocks)
-
-    params = {
-        'token_embedding': jax.random.normal(keys[0], (model_config.vocab_size, model_config.embedding_dim)) * scaling_factor,
-        'positional_embedding': jax.random.normal(keys[1], (model_config.context_len, model_config.embedding_dim)) * scaling_factor,
-        'output_projection': jax.random.normal(keys[2], (model_config.embedding_dim, model_config.vocab_size)) * scaling_factor,
-        'lnf': {
-            'gamma': jnp.ones((model_config.embedding_dim,)),
-            'beta': jnp.zeros((model_config.embedding_dim,)),
-        },
-    }
-
-    for i in range(model_config.n_blocks):
-        block_key_start = 3 + i * 10
-        params[f'block_{i}'] = {
-            'attn_in': {
-                'weight': jax.random.normal(keys[block_key_start], (model_config.embedding_dim, 3*model_config.embedding_dim)) * scaling_factor,
-                'bias': jax.random.normal(keys[block_key_start+1], (3*model_config.embedding_dim,)) * scaling_factor,
-            },
-            'attn_out': {
-                'weight': jax.random.normal(keys[block_key_start+2], (model_config.embedding_dim, model_config.embedding_dim)) * scaling_factor,
-                'bias': jax.random.normal(keys[block_key_start+3], (model_config.embedding_dim,)) * scaling_factor,
-            },
-            'ln1': {
-                'gamma': jnp.ones((model_config.embedding_dim,)),
-                'beta': jnp.zeros((model_config.embedding_dim,)),
-            },
-            'ln2': {
-                'gamma': jnp.ones((model_config.embedding_dim,)),
-                'beta': jnp.zeros((model_config.embedding_dim,)),
-            },
-            'ffn_in': {
-                'weight': jax.random.normal(keys[block_key_start+4], (model_config.embedding_dim, 4*model_config.embedding_dim)) * scaling_factor,
-                'bias': jax.random.normal(keys[block_key_start+5], (4*model_config.embedding_dim,)) * scaling_factor,
-            },
-            'ffn_out': {
-                'weight': jax.random.normal(keys[block_key_start+6], (4*model_config.embedding_dim, model_config.embedding_dim)) * scaling_factor,
-                'bias': jax.random.normal(keys[block_key_start+7], (model_config.embedding_dim,)) * scaling_factor,
-            },
-        }
-
-    return params
-
-def load_gpt2_params(model_name: str = "gpt2") -> Tuple[Dict[str, Any], ModelConfig]:
-    """
-    loads GPT2 weights from hugging face and puts them into the predefined template
-    radford et al, 2019: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
-    """
-
-    model = GPT2LMHeadModel.from_pretrained(model_name)
-    config = model.config
-
-    
-    model_config = ModelConfig(
-        vocab_size=config.vocab_size,
-        embedding_dim=config.n_embd,
-        context_len=config.n_positions,
-        n_head=config.n_head,
-        n_blocks=config.n_layer
-    )
-
-    converted_params = {}
-    converted_params['token_embedding'] = jnp.array(model.transformer.wte.weight.detach().numpy())
-    converted_params['positional_embedding'] = jnp.array(model.transformer.wpe.weight.detach().numpy())
-    converted_params['output_projection'] = jnp.array(model.lm_head.weight.detach().numpy().T)
-    converted_params['lnf'] = {
-        'gamma': jnp.array(model.transformer.ln_f.weight.detach().numpy()),
-        'beta': jnp.array(model.transformer.ln_f.bias.detach().numpy())
-    }
-
-    for i in range(model_config.n_blocks):
-        block = model.transformer.h[i]
-        converted_block = {
-            'attn_in': {
-                'weight': jnp.array(block.attn.c_attn.weight.detach().numpy()),
-                'bias': jnp.array(block.attn.c_attn.bias.detach().numpy())
-            },
-            'attn_out': {
-                'weight': jnp.array(block.attn.c_proj.weight.detach().numpy()),
-                'bias': jnp.array(block.attn.c_proj.bias.detach().numpy())
-            },
-            'ln1': {
-                'gamma': jnp.array(block.ln_1.weight.detach().numpy()),
-                'beta': jnp.array(block.ln_1.bias.detach().numpy())
-            },
-            'ln2': {
-                'gamma': jnp.array(block.ln_2.weight.detach().numpy()),
-                'beta': jnp.array(block.ln_2.bias.detach().numpy())
-            },
-            'ffn_in': {
-                'weight': jnp.array(block.mlp.c_fc.weight.detach().numpy()),
-                'bias': jnp.array(block.mlp.c_fc.bias.detach().numpy())
-            },
-            'ffn_out': {
-                'weight': jnp.array(block.mlp.c_proj.weight.detach().numpy()),
-                'bias': jnp.array(block.mlp.c_proj.bias.detach().numpy())
-            },
-        }
-        converted_params[f'block_{i}'] = converted_block
-
-    return converted_params, model_config
-
 # Positional Encoding
 
 def apply_rotary_emb(xq: jax.Array, xk: jax.Array, rotation_matrices: jax.Array) -> Tuple[jax.Array, jax.Array]:
@@ -226,9 +105,9 @@ def apply_rotary_emb(xq: jax.Array, xk: jax.Array, rotation_matrices: jax.Array)
     
     return jax.vmap(adjust_frequency)(raw_frequencies)
 
-def initialize_rotation_matrices(dim: int, seq_len: int, theta: float = 500000.0):
+def initialize_rotation_factors(dim: int, seq_len: int, theta: float = 500000.0):
     """
-    precomputes complex rotation matrices for RoPE to avoid redundant computation during attention
+    precomputes complex rotation factors for RoPE to avoid redundant computation during attention
     captures range of patterns by using diff frequencies depending on the embedding dimension's index
     su et al, 2021: https://arxiv.org/abs/2104.09864
     """
@@ -242,7 +121,7 @@ def initialize_rotation_matrices(dim: int, seq_len: int, theta: float = 500000.0
     positions = jnp.arange(seq_len)
     frequencies = jnp.outer(positions, frequencies)
     
-    # convert to complex rotation matrix with euler's formula
+    # convert to complex rotation factors with euler's formula
     return jnp.exp(1j * frequencies) # 1j is the imaginary unit
 
 def create_causal_mask(seq_len: int, start_pos: int = 0):
@@ -332,7 +211,94 @@ def grouped_query_attn(x: jax.Array, w_qkv: jax.Array, b_qkv: jax.Array, w_proj:
 
     return token_logits, kv_cache
 
+def grouped_query_attn_llama(x: jax.Array, wq: jax.Array, wk: jax.Array, wv: jax.Array, wo: jax.Array, model_config: ModelConfig, causal_mask: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
+    """
+    standard attention that processes input sequence in parallel, enabling attention heads to focus on different aspects of the input
+    vaswani et al, 2017: https://arxiv.org/abs/1706.03762
+    """
+
+    seq_len, embed_dim = x.shape
+
+    head_dim = embed_dim // model_config.n_head
+    if model_config.n_kv_head is not None:
+        n_rep = model_config.n_head // model_config.n_kv_head
+    else:
+        n_rep = 1
+
+    xq = jnp.dot(x,wq)
+    xk = jnp.dot(x,wk)
+    xv = jnp.dot(x,wv)
+
+    kv_head = model_config.n_kv_head if model_config.n_kv_head else model_config.n_head
+
+    xq = xq.reshape(seq_len, model_config.n_head, head_dim)
+    xk = xk.reshape(seq_len, kv_head, head_dim)
+    xv = xv.reshape(seq_len, kv_head, head_dim)
+
+    if kv_cache is not None:
+        xk, xv, kv_cache = kv_cache.update(xk, xv, block_idx, cur_pos, n_rep)
+        xk = xk[:cur_pos + seq_len]
+        xv = xv[:cur_pos + seq_len]
+    
+    xq = xq.transpose(1, 0, 2)
+    xkt = xk.transpose(1, 2, 0)
+    xv = xv.transpose(1, 0, 2)
+
+    scaled_scores = jnp.matmul(xq, xkt)/ jnp.sqrt(head_dim) 
+
+    if cur_pos == 0:
+        scaled_scores = scaled_scores + causal_mask
+
+    mask_val = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
+    mask = jnp.where(scaled_scores != 0.0, scaled_scores, mask_val)
+    padded_logits = jnp.where((mask >= mask_val * 0.5), scaled_scores, mask_val)
+    attn_weights = jax.nn.softmax(padded_logits, axis=-1)
+
+    context_weights = jnp.matmul(attn_weights, xv) 
+    transposed_context_weights = context_weights.transpose(1, 0, 2) 
+    reshaped_context_weights = transposed_context_weights.reshape(seq_len, embed_dim) 
+    token_logits = jnp.dot(reshaped_context_weights, wo) 
+
+    return token_logits, kv_cache
+
 # Forward Pass
+
+def llama_forward(model_params: Dict[str, Any], model_config: ModelConfig, tokens: jax.Array, causal_mask: jax.Array, rotation_factors: jax.Array, cur_pos: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
+    seq_len = tokens.shape[0] # (seq_len,)
+    token_embeds = model_params['tok_embeddings'][tokens] # (seq_len,) -> (seq_len, embed_dim)
+
+    for i in range(model_config.n_blocks):
+        x, kv_cache = llama_block(x, model_params[f'layer_{i}'], model_config, causal_mask, cur_pos=cur_pos, rotation_factors=rotation_factors, block_idx=i, kv_cache=kv_cache) # (seq_len, embed_dim) -> (seq_len, embed_dim)
+
+    x = rms_norm(x, model_params['norm']['weight'])
+    token_logits = jnp.dot(x, model_params['output']) # (seq_len, embed_dim) -> (seq_len, vocab_size)
+    return token_logits, kv_cache
+
+def llama_block(x: jax.Array, block_params: Dict[str, Dict[str, jax.Array]], model_config: ModelConfig, causal_mask: jax.Array, rotation_factors: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> jax.Array:
+
+    residual = x
+    normed_x = rms_norm(x, block_params['attention_norm']['weight'])
+
+    context, kv_cache = grouped_query_attn_llama( # llama params defined differently, ok to make a new function??
+        normed_x,
+        block_params['attention']['wq'],
+        block_params['attention']['wk'],
+        block_params['attention']['wv'],
+        block_params['attention']['wo'],
+        model_config,
+        causal_mask,
+        cur_pos=cur_pos,
+        block_idx=block_idx,
+        kv_cache=kv_cache
+    )
+
+    context = context + residual
+    context_residual = context
+    normed_context = rms_norm(context, block_params['ffn_norm']['weight'])
+
+    enhanced_context = swiglu(normed_context, block_params['feed_forward']['w1'], block_params['feed_forward']['w3'], block_params['feed_forward']['w2'])
+    enhanced_context = enhanced_context + context_residual
+    return enhanced_context, kv_cache  
 
 def gpt2_forward(model_params: Dict[str, Any], model_config: ModelConfig, tokens: jax.Array, causal_mask: jax.Array, cur_pos: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
     """
