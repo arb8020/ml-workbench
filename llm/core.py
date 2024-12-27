@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from typing import NamedTuple, Dict, Any, Optional, Tuple, Union
 from transformers import GPT2LMHeadModel
 from functools import partial
+from models import ModelConfig
 
 # Activations
 
@@ -89,6 +90,8 @@ def apply_rotary_emb(xq: jax.Array, xk: jax.Array, rotation_matrices: jax.Array)
     think abt polar form trickery
     su et al, 2021: https://arxiv.org/abs/2104.09864
     """
+    seq_len = xq.shape[0]
+    rotation_matrices = rotation_matrices[:seq_len]
     # split into real/imaginary pairs
     reshape_xq = xq.reshape(*xq.shape[:-1], -1, 2) 
     reshape_xk = xk.reshape(*xk.shape[:-1], -1, 2)
@@ -105,7 +108,7 @@ def apply_rotary_emb(xq: jax.Array, xk: jax.Array, rotation_matrices: jax.Array)
     
     return jax.vmap(adjust_frequency)(raw_frequencies)
 
-def initialize_rotation_factors(dim: int, seq_len: int, theta: float = 500000.0):
+def initialize_rotation_factors(dim: int, seq_len: int, theta: float = 500000.0, use_ntk_scaling: bool = True):
     """
     precomputes complex rotation factors for RoPE to avoid redundant computation during attention
     captures range of patterns by using diff frequencies depending on the embedding dimension's index
@@ -115,7 +118,9 @@ def initialize_rotation_factors(dim: int, seq_len: int, theta: float = 500000.0)
     # later dim -> low freq -> rotates slow -> global patterns
     frequencies = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)] / dim))
     
-    # NTK aware scaling (todo)
+    # NTK aware scaling
+    if use_ntk_scaling:
+        frequencies = apply_ntk_scaling(frequencies)
     
     # multiply each pos by each frequency
     positions = jnp.arange(seq_len)
@@ -123,6 +128,32 @@ def initialize_rotation_factors(dim: int, seq_len: int, theta: float = 500000.0)
     
     # convert to complex rotation factors with euler's formula
     return jnp.exp(1j * frequencies) # 1j is the imaginary unit
+
+def apply_ntk_scaling(frequencies: jax.Array, scaling_factor: int = 8, low_freq_factor: int = 1, high_freq_factor: int = 4, original_context: int = 4096):
+  """
+  allows for extended context length from pretrained length by scaling base frequencies used to initialize rotation matrices in RoPE
+  applies neural tangent kernel theory to the rotary positional embedding to nonlinearly scale RoPE's base
+  bloc97, 2023: https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_rope_allows_llama_models_to_have/
+  """
+  
+  low_freq_wavelen = original_context / low_freq_factor
+  high_freq_wavelen = original_context / high_freq_factor
+
+  def scale_frequencies(freq):
+    wavelen = 2 * jnp.pi / freq
+
+    def interpolate_scaling(_):
+      smooth = (original_context / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+      return (1 - smooth) * freq / scaling_factor + smooth * freq
+
+    return jax.lax.cond(
+      wavelen < high_freq_wavelen,
+      lambda _: freq,
+      lambda _: jax.lax.cond(wavelen > low_freq_wavelen, lambda _: freq / scaling_factor, interpolate_scaling, None),
+      None
+    )
+
+  return jax.vmap(scale_frequencies)(frequencies)
 
 def create_causal_mask(seq_len: int, start_pos: int = 0):
     """
@@ -144,17 +175,17 @@ class KVCache(NamedTuple):
     finds a middle ground between multi-head attention performance and managing memory bandwidth of reloading k/v tensors in kv cached inference
     ainslie et al, 2023: https://arxiv.org/pdf/2305.13245
     """
-    keys: jax.Array    # (n_blocks, seq_len, n_head, head_dim)
-    values: jax.Array  # (n_blocks, seq_len, n_head, head_dim)
+    keys: jax.Array    # (n_layers, seq_len, n_head, head_dim)
+    values: jax.Array  # (n_layers, seq_len, n_head, head_dim)
     
     @classmethod
     def init(cls, model_config: ModelConfig) -> 'KVCache':
 
-        if model_config.n_kv_head is not None:
-            cache_heads = model_config.n_kv_head
+        if model_config.n_kv_heads is not None:
+            cache_heads = model_config.n_kv_heads
         else:
-            cache_heads = model_config.n_head
-        shape = (model_config.n_blocks, model_config.context_len, cache_heads, model_config.embedding_dim // model_config.n_head)
+            cache_heads = model_config.n_heads
+        shape = (model_config.n_layers, model_config.context_len, cache_heads, model_config.embedding_dim // model_config.n_heads)
 
         return cls(keys=jnp.zeros(shape), values=jnp.zeros(shape))
     
@@ -175,21 +206,24 @@ def grouped_query_attn(x: jax.Array, w_qkv: jax.Array, b_qkv: jax.Array, w_proj:
 
     seq_len, embed_dim = x.shape
 
-    head_dim = embed_dim // model_config.n_head
-    if model_config.n_kv_head is not None:
-        n_rep = model_config.n_head // model_config.n_kv_head
+    head_dim = embed_dim // model_config.n_heads
+    if model_config.n_kv_heads is not None:
+        n_rep = model_config.n_heads // model_config.n_kv_heads
     else:
         n_rep = 1
 
     x_qkv = jnp.dot(x, w_qkv) + b_qkv 
-    x_qkv_heads = x_qkv.reshape(seq_len, 3, model_config.n_head, head_dim)
+    x_qkv_heads = x_qkv.reshape(seq_len, 3, model_config.n_heads, head_dim)
     xq, xk, xv = x_qkv_heads[:, 0], x_qkv_heads[:, 1], x_qkv_heads[:, 2] 
    
     if kv_cache is not None:
         xk, xv, kv_cache = kv_cache.update(xk, xv, block_idx, cur_pos, n_rep)
         xk = xk[:cur_pos + seq_len]
         xv = xv[:cur_pos + seq_len]
-    
+    else:
+        xk = jnp.repeat(xk, n_rep, axis=1)
+        xv = jnp.repeat(xv, n_rep, axis=1)
+
     xq = xq.transpose(1, 0, 2)
     xkt = xk.transpose(1, 2, 0)
     xv = xv.transpose(1, 0, 2)
@@ -211,7 +245,7 @@ def grouped_query_attn(x: jax.Array, w_qkv: jax.Array, b_qkv: jax.Array, w_proj:
 
     return token_logits, kv_cache
 
-def grouped_query_attn_llama(x: jax.Array, wq: jax.Array, wk: jax.Array, wv: jax.Array, wo: jax.Array, model_config: ModelConfig, causal_mask: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
+def grouped_query_attn_llama(x: jax.Array, wq: jax.Array, wk: jax.Array, wv: jax.Array, wo: jax.Array, model_config: ModelConfig, causal_mask: jax.Array, rotation_matrices: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
     """
     standard attention that processes input sequence in parallel, enabling attention heads to focus on different aspects of the input
     vaswani et al, 2017: https://arxiv.org/abs/1706.03762
@@ -219,9 +253,9 @@ def grouped_query_attn_llama(x: jax.Array, wq: jax.Array, wk: jax.Array, wv: jax
 
     seq_len, embed_dim = x.shape
 
-    head_dim = embed_dim // model_config.n_head
-    if model_config.n_kv_head is not None:
-        n_rep = model_config.n_head // model_config.n_kv_head
+    head_dim = embed_dim // model_config.n_heads
+    if model_config.n_kv_heads is not None:
+        n_rep = model_config.n_heads // model_config.n_kv_heads
     else:
         n_rep = 1
 
@@ -229,16 +263,21 @@ def grouped_query_attn_llama(x: jax.Array, wq: jax.Array, wk: jax.Array, wv: jax
     xk = jnp.dot(x,wk)
     xv = jnp.dot(x,wv)
 
-    kv_head = model_config.n_kv_head if model_config.n_kv_head else model_config.n_head
+    kv_head = model_config.n_kv_heads if model_config.n_kv_heads else model_config.n_heads
 
-    xq = xq.reshape(seq_len, model_config.n_head, head_dim)
+    xq = xq.reshape(seq_len, model_config.n_heads, head_dim)
     xk = xk.reshape(seq_len, kv_head, head_dim)
     xv = xv.reshape(seq_len, kv_head, head_dim)
+
+    xq, xk = apply_rotary_emb(xq, xk, rotation_matrices)
 
     if kv_cache is not None:
         xk, xv, kv_cache = kv_cache.update(xk, xv, block_idx, cur_pos, n_rep)
         xk = xk[:cur_pos + seq_len]
         xv = xv[:cur_pos + seq_len]
+    else:
+        xk = jnp.repeat(xk, n_rep, axis=1)
+        xv = jnp.repeat(xv, n_rep, axis=1)
     
     xq = xq.transpose(1, 0, 2)
     xkt = xk.transpose(1, 2, 0)
@@ -263,22 +302,24 @@ def grouped_query_attn_llama(x: jax.Array, wq: jax.Array, wk: jax.Array, wv: jax
 
 # Forward Pass
 
-def llama_forward(model_params: Dict[str, Any], model_config: ModelConfig, tokens: jax.Array, causal_mask: jax.Array, rotation_factors: jax.Array, cur_pos: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
+def llama_forward(model_params: Dict[str, Any], model_config: ModelConfig, tokens: jax.Array, causal_mask: jax.Array, cur_pos: int = 0, kv_cache: Optional[KVCache] = None, rotation_factors: jax.Array = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
+    
     seq_len = tokens.shape[0] # (seq_len,)
     token_embeds = model_params['tok_embeddings'][tokens] # (seq_len,) -> (seq_len, embed_dim)
+    x = token_embeds
 
-    for i in range(model_config.n_blocks):
-        x, kv_cache = llama_block(x, model_params[f'layer_{i}'], model_config, causal_mask, cur_pos=cur_pos, rotation_factors=rotation_factors, block_idx=i, kv_cache=kv_cache) # (seq_len, embed_dim) -> (seq_len, embed_dim)
+    for i in range(model_config.n_layers):
+        x, kv_cache = llama_block(x, model_params[f'layer_{i}'], model_config, causal_mask, cur_pos=cur_pos, rotation_matrices=rotation_factors, block_idx=i, kv_cache=kv_cache) # (seq_len, embed_dim) -> (seq_len, embed_dim)
 
     x = rms_norm(x, model_params['norm']['weight'])
-    token_logits = jnp.dot(x, model_params['output']) # (seq_len, embed_dim) -> (seq_len, vocab_size)
+    token_logits = jnp.dot(x, model_params['output'].T) # (seq_len, embed_dim) -> (seq_len, vocab_size)
     return token_logits, kv_cache
 
-def llama_block(x: jax.Array, block_params: Dict[str, Dict[str, jax.Array]], model_config: ModelConfig, causal_mask: jax.Array, rotation_factors: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> jax.Array:
+def llama_block(x: jax.Array, block_params: Dict[str, Dict[str, jax.Array]], model_config: ModelConfig, causal_mask: jax.Array, rotation_matrices: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> jax.Array:
 
     residual = x
     normed_x = rms_norm(x, block_params['attention_norm']['weight'])
-
+    
     context, kv_cache = grouped_query_attn_llama( # llama params defined differently, ok to make a new function??
         normed_x,
         block_params['attention']['wq'],
@@ -287,6 +328,7 @@ def llama_block(x: jax.Array, block_params: Dict[str, Dict[str, jax.Array]], mod
         block_params['attention']['wo'],
         model_config,
         causal_mask,
+        rotation_matrices=rotation_matrices,
         cur_pos=cur_pos,
         block_idx=block_idx,
         kv_cache=kv_cache
@@ -298,7 +340,7 @@ def llama_block(x: jax.Array, block_params: Dict[str, Dict[str, jax.Array]], mod
 
     enhanced_context = swiglu(normed_context, block_params['feed_forward']['w1'], block_params['feed_forward']['w3'], block_params['feed_forward']['w2'])
     enhanced_context = enhanced_context + context_residual
-    return enhanced_context, kv_cache  
+    return enhanced_context, kv_cache
 
 def gpt2_forward(model_params: Dict[str, Any], model_config: ModelConfig, tokens: jax.Array, causal_mask: jax.Array, cur_pos: int = 0, kv_cache: Optional[KVCache] = None) -> Tuple[jax.Array, Optional[Dict[str, jax.Array]]]:
     """
@@ -315,14 +357,14 @@ def gpt2_forward(model_params: Dict[str, Any], model_config: ModelConfig, tokens
     
     x = token_embeds + pos_embeds 
 
-    for i in range(model_config.n_blocks):
-        x, kv_cache = transformer_block(x, model_params[f'block_{i}'], model_config, causal_mask, cur_pos=cur_pos, block_idx=i, kv_cache=kv_cache) # (seq_len, embed_dim) -> (seq_len, embed_dim)
+    for i in range(model_config.n_layers):
+        x, kv_cache = gpt2_block(x, model_params[f'block_{i}'], model_config, causal_mask, cur_pos=cur_pos, block_idx=i, kv_cache=kv_cache) # (seq_len, embed_dim) -> (seq_len, embed_dim)
 
     x = layer_norm(x, model_params['lnf']['gamma'], model_params['lnf']['beta'])
     token_logits = jnp.dot(x, model_params['output_projection']) # (seq_len, embed_dim) -> (seq_len, vocab_size)
     return token_logits, kv_cache
 
-def transformer_block(x: jax.Array, block_params: Dict[str, Dict[str, jax.Array]], model_config: ModelConfig, causal_mask: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> jax.Array:
+def gpt2_block(x: jax.Array, block_params: Dict[str, Dict[str, jax.Array]], model_config: ModelConfig, causal_mask: jax.Array, cur_pos: int = 0, block_idx: int = 0, kv_cache: Optional[KVCache] = None) -> jax.Array:
     """
     full GPT2 transformer block, attention + FFN with residual connections and layer norms
     vaswani et al, 2017: https://arxiv.org/abs/1706.03762

@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from typing import NamedTuple, Dict, Callable, Any, Tuple, Optional, Union
 from functools import partial
-from model import ModelConfig, gpt2_forward, create_causal_mask, KVCache
+from core import ModelConfig, gpt2_forward, llama_forward, create_causal_mask, KVCache
 
 # Tokenization
 
@@ -195,13 +195,13 @@ def init_adam_state(params: Dict, opt_config: AdamConfig) -> OptimizerState:
         'step': 0
     }
 
-def init_optimizer(name: str, params: Dict, **kwargs) -> Tuple[Dict, Callable, NamedTuple]:
+def init_optimizer(name: str, params: Dict, **opt_kwargs) -> Tuple[Dict, Callable, NamedTuple]:
     """
     initialize optimizer state and return update function with config
     """
 
     init_fn, update_fn, config_cls = OPTIMIZERS[name]
-    config = config_cls(**kwargs)
+    config = config_cls(**opt_kwargs)
     state = init_fn(params, config)
     return state, update_fn, config
 
@@ -304,7 +304,6 @@ OPTIMIZERS = {
     'adam': (init_adam_state, adamw_update, AdamConfig)
 }
 
-
 # Training 
 
 class TrainConfig(NamedTuple):
@@ -314,22 +313,22 @@ class TrainConfig(NamedTuple):
     batch_seq_len: int
     seed: int
     
-def batch_forward(params: Dict, model_config: Dict, model_name: str, input_batch: jnp.ndarray) -> jnp.ndarray:
+def batch_forward(params: Dict, model_config: Dict, model_name: str, input_batch: jnp.ndarray, model_kwargs: Dict = {},) -> jnp.ndarray:
     """
     automatically vectorizes a specified model forward pass
     """ 
     causal_mask = create_causal_mask(input_batch.shape[1])
-    return jax.vmap(lambda x: model_dict[model_name](params, model_config, x, causal_mask=causal_mask))(input_batch)
+    return jax.vmap(lambda x: model_dict[model_name](params, model_config, x, causal_mask=causal_mask, **model_kwargs))(input_batch)
 
 @partial(jax.jit, static_argnames=['train_config', 'model_config', 'model_name', 'opt_name'])
-def train_step(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, opt_state: OptimizerState, opt_config: OptConfig, opt_name: str, train_config: TrainConfig, key: jax.random.PRNGKey) -> Tuple[Dict, OptimizerState, float]:
+def train_step(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, opt_state: OptimizerState, opt_config: OptConfig, opt_name: str, train_config: TrainConfig, key: jax.random.PRNGKey, model_kwargs: Dict = {}) -> Tuple[Dict, OptimizerState, float]:
     """
     jit-compiled training step - creates batches + computes gradient + optimizer update
     rumelhart/hinton/willians, 1986: https://www.nature.com/articles/323533a0
     """
 
     def batch_loss_fn(params, input_batch, target_batch):
-        logits, _ = batch_forward(params, model_config, model_name, input_batch)
+        logits, _ = batch_forward(params, model_config, model_name, input_batch, model_kwargs)
         batch_loss = cross_entropy_loss(logits, target_batch)
         return batch_loss
 
@@ -343,7 +342,7 @@ def train_step(params: Dict, model_config: ModelConfig, model_name: str, tokens:
 
     return new_params, new_opt_state, loss
 
-def train(params: Dict, model_config: ModelConfig, model_name: str, tokens: jnp.ndarray, opt_config: OptConfig, opt_name: str, train_config: TrainConfig, key=jax.random.PRNGKey(0)):
+def train(params: Dict, model_config: ModelConfig, model_name: str, tokens: jnp.ndarray, opt_config: OptConfig, opt_name: str, train_config: TrainConfig, key=jax.random.PRNGKey(0), model_kwargs: Dict = {}):
     """
     training loop
     """
@@ -369,7 +368,7 @@ def train(params: Dict, model_config: ModelConfig, model_name: str, tokens: jnp.
         for _ in range(train_config.batches_per_epoch):
             key, subkey = jax.random.split(key, 2)
             new_params, opt_state, loss = train_step(
-                params, model_config, model_name, tokens, opt_state, opt_config, opt_name, train_config, key=subkey
+                params, model_config, model_name, tokens, opt_state, opt_config, opt_name, train_config, key=subkey, model_kwargs=model_kwargs,
             )
             epoch_loss += loss
 
@@ -386,7 +385,7 @@ class EvalConfig(NamedTuple):
     stride: int = 512
          
 @partial(jax.jit, static_argnames=['model_config', 'model_name', 'eval_config'])
-def sliding_ppl_eval_step(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, start_idx: int, eval_config: EvalConfig) -> float:
+def sliding_ppl_eval_step(params: Dict, model_config: ModelConfig, model_name: str, tokens: jax.Array, start_idx: int, eval_config: EvalConfig, model_kwargs: Dict = {}) -> float:
     """
     jit-compiled perplexity evaluation step
     """
@@ -394,13 +393,13 @@ def sliding_ppl_eval_step(params: Dict, model_config: ModelConfig, model_name: s
     target_seq = jax.lax.dynamic_slice(tokens, (start_idx + 1,), (eval_config.seq_len,))
     causal_mask = create_causal_mask(eval_config.seq_len)
     
-    logits, _ = model_dict[model_name](params, model_config, input_seq, causal_mask)
+    logits, _ = model_dict[model_name](params, model_config, input_seq, causal_mask, **model_kwargs)
     loss = cross_entropy_loss(logits, target_seq)
     return loss
 
     return perplexity
 
-def eval_perplexity(params: Dict, model_config: ModelConfig, model_name: str, tokens: jnp.ndarray, eval_config: EvalConfig = EvalConfig()):
+def eval_perplexity(params: Dict, model_config: ModelConfig, model_name: str, tokens: jnp.ndarray, eval_config: EvalConfig = EvalConfig(), model_kwargs: Dict = {}):
     """
     evaluates model perplexity with sliding window
     huggingface: https://github.com/huggingface/transformers/blob/main/docs/source/en/perplexity.md
@@ -417,7 +416,7 @@ def eval_perplexity(params: Dict, model_config: ModelConfig, model_name: str, to
     total_tokens = 0
     
     for start_idx in range(0, len(tokens) - eval_config.seq_len, eval_config.stride):
-        loss = sliding_ppl_eval_step(params, model_config, model_name, tokens, start_idx, eval_config)
+        loss = sliding_ppl_eval_step(params, model_config, model_name, tokens, start_idx, eval_config, model_kwargs)
         total_loss += loss * eval_config.seq_len 
         total_tokens += eval_config.seq_len
         
@@ -427,4 +426,86 @@ def eval_perplexity(params: Dict, model_config: ModelConfig, model_name: str, to
     
     return perplexity
 
-model_dict = {'gpt2': gpt2_forward}
+model_dict = {'gpt2': gpt2_forward, 'llama': llama_forward}
+
+# Inference
+
+class SamplerConfig(NamedTuple):
+    temp: float = 1.0
+    min_p: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[float] = None
+    max_tokens: int = 100
+    key: jax.random.PRNGKey = jax.random.PRNGKey(0)
+
+def sample_token(logits: jax.Array, sampler_config: SamplerConfig) -> jax.Array:
+    """
+    samples token from a distribution, includes filtering parameters like temperature/top_k for controlling generation
+    radford et al, 2019: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+    nguyen et al, 2024: https://arxiv.org/abs/2407.01082 (min_p)
+    holtzman et al, 2019: https://arxiv.org/abs/1904.09751 (top_p)
+    """
+        
+    scaled_logits = logits / sampler_config.temp
+    probs = jax.nn.softmax(scaled_logits, axis=-1)
+    
+    if sampler_config.min_p:
+        max_prob = jnp.max(probs)
+        min_p_threshold = sampler_config.min_p * max_prob
+        scaled_logits = jnp.where(probs < min_p_threshold, float('-inf'), scaled_logits)
+        return jax.random.categorical(sampler_config.key, scaled_logits)
+        
+    elif sampler_config.top_p:
+        sorted_indices = jnp.argsort(probs, axis=-1)[::-1]
+        cumsum = jnp.cumsum(probs[sorted_indices])
+        sorted_mask = cumsum <= sampler_config.top_p
+        mask = jnp.zeros_like(probs).at[sorted_indices].set(sorted_mask)
+        scaled_logits = jnp.where(mask, scaled_logits, float('-inf'))
+        return jax.random.categorical(sampler_config.key, scaled_logits)
+        
+    elif sampler_config.top_k:
+        top_k = jnp.minimum(sampler_config.top_k, probs.shape[-1])
+        top_k_probs = jnp.sort(probs, axis=-1)[-top_k:]
+        threshold = top_k_probs[0]
+        scaled_logits = jnp.where(probs < threshold, float('-inf'), scaled_logits)
+        return jax.random.categorical(sampler_config.key, scaled_logits)
+        
+    return jax.random.categorical(sampler_config.key, scaled_logits)
+
+def generate(params: Dict[str, Any], model_config: ModelConfig, model_name, tokens: jax.Array, sampler_config: SamplerConfig, model_kwargs: Dict = {}, stream: bool = True, tokenizer: Tokenizer = None) -> jax.Array:
+    """
+    generates text with kv caching
+    radford et al, 2019: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+    """
+    
+    gen_tokens = jnp.array([], dtype=jnp.int32)
+    cur_pos = 0
+    seq_len = tokens.shape[0]
+
+    kv_cache = KVCache.init(model_config)
+    causal_mask = create_causal_mask(seq_len, cur_pos)
+
+    logits, kv_cache = model_dict[model_name](params, model_config, tokens, causal_mask, cur_pos=cur_pos, kv_cache=kv_cache, **model_kwargs)
+
+    next_token = sample_token(logits[-1:], sampler_config)
+    gen_tokens = jnp.concatenate((gen_tokens, next_token))
+    tokens = jnp.concatenate((tokens, next_token))
+
+    cur_pos = seq_len
+
+    while cur_pos < sampler_config.max_tokens:
+        logits, kv_cache = model_dict[model_name](params, model_config, next_token, causal_mask=causal_mask, cur_pos=cur_pos, kv_cache=kv_cache, **model_kwargs)
+        
+        next_token = sample_token(logits[-1:], sampler_config)
+        if stream and tokenizer:
+            print(tokenizer.decode(next_token), end='', flush=True)
+            
+        gen_tokens = jnp.concatenate((gen_tokens, next_token))
+        tokens = jnp.concatenate((tokens, next_token))
+        cur_pos += 1
+
+    if stream:
+        print()
+    
+    print(f'generated: {len(gen_tokens)} tokens')
+    return gen_tokens

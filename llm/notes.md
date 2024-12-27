@@ -38,10 +38,30 @@ note that we don't add new parameters! the size of each head's embedding dimensi
 we create these heads simply by splitting up the initial (embed_dim, embed_dim) matrix, and concatenating the results later
 so the top half might end up being the syntactic part of attention, the bottom half might end up being the semantic part of attention, etc
 
+### kv caching
+
+attention is great while we train a model: for a given sliding window, we process attention over an entire sequence at a time
+since we're evaluating a full sequence at a time, we can parallelize the operation and mask things out as necessary to avoid forward-looking behavior when undesirable
+but during inference, this doesn't really apply. say we've generated 3 out of 16 tokens so far. to compute the 4th token, we compute attention over the 4 tokens, 16 computations
+now to compute the 5th token, we perform attention again, over 5 tokens, 25 comparisons
+but we've already computed the comparisons between positions 0-1, 0-2, ... we only really need to do the comparisons considering the new 5th token
+these key/value vectors won't change, so to save on computational load, we store them in a KV cache
+when we run each new forward pass, we can load in the old K/V vectors, compute the new ones, and store them for the next forward pass 
+in this manner, we trade memory for faster compute during inference
+
 ### grouped query attention 
 
-
-
+while we get to save a lot of compute, we still need a lot of memory during inference to maintain the kv cache
+for standard multi head attention, this means key and value vectors for each layer, for each head
+empirically, it seems to be the case that the different attention heads actually end up encoding quite similar key/value vectors
+in multi query attention, we basically just duplicate key and value vectors across every head, and only use different queries across heads
+this is because we predict that a well trained model will be able to encode the required information for all heads in one set of key/value vectors
+while this method saves a ton on memory, it sometimes degrades model performance, as the heads don't get to encode as much different info across heads in the key/values
+so grouped query attention is a flexible compromise between standard multi head attention and grouped query attention
+we assign queries to groups of heads, and define a new parameter kv_heads, which dictates how many heads get unique key/value vectors
+in standard multi head attention, n_kv_heads is just n_heads, as each head gets its own set of key/value vectors
+and in multi query attention, n_kv_heads is equal to 1, as there's just one set of key/value vectors across all heads
+in grouped query attention, n_kv_heads must a divisor of n_heads - and we can use multi query or multi head attention as described above, so this is a backwards-compatible improvement to multi head attention
 
 ### feedforward/fully connected network
 
@@ -212,7 +232,10 @@ note that we choose to put the log transform on our q distribution bc log(0) is 
 
 ### perplexity
 
-TODO: 
+while we use cross entropy loss to train the model, its not as easily human-interpretable
+since cross-entropy is log transformed, the differences in uncertainty in predicting each token is 'compressed' in a sense
+to decompress this, we can take the exponential of cross entropy to derive a rough measure of the amount of tokens the model is choosing from on average
+we call this perplexity - we take the average perplexity over a sliding window of a dataset to get a interpretable number describing how certain the model is (or how perplexed it is)
 
 ## optimizers
 
@@ -332,4 +355,15 @@ and concatenate the vector back from (..., 2) back to how it was before
 
 ### scaled rope
 
-todo
+rope is pretty great for encoding positional information using relative distance, as we just discussed
+but the frequency values are bounded by the context length of the initial pretraining parameters - how will we handle longer inputs? 
+the simplest way to do this is simply to scale the frequencies using the new length we want to generate
+new_freq = old_freq * old_len/new_len
+but this disproportionately impacts the higher frequency/lower wavelen components, which means finer relationships degrade
+think of rope like a clock: you can only measure those 12 hours that you set up on the clock
+and linearly scaling in the way we just described just means the seconds/minute/hour hands move more slowly by that constant factor
+before, if someone showed you two clocks, each a few seconds apart, they were distinguishable, albeit maybe with some difficulty
+but after the scaling, that same time has the seconds hands much closer to each other, harder to understand the difference between them
+so we basically want to 'protect' some lower bound, like the seconds or similar, and not scale it
+and we can have a upper bound where we can fully scale, like hours or days in our example, since they'll still be easy to distinguish
+and between these, we interpolate between the scaling factor of the lower bound and the scaling factor used at the upper bound
